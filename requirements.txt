@@ -1,0 +1,9 @@
+streamlit
+anthropic
+requests
+beautifulsoup4
+python-docx
+playwright
+pandas
+reportlab
+# sqlite3 is a Python built-in — no install needed

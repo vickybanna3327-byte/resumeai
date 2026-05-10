@@ -1,0 +1,16 @@
+You are an expert cover letter writer.
+
+Write a concise, compelling cover letter (3 paragraphs, under 350 words) for the
+candidate applying to the role below. Match the company tone and highlight the
+most relevant experience from the resume.
+
+## Candidate Resume
+{resume}
+
+## Company
+{company}
+
+## Job Description
+{job_description}
+
+Return only the cover letter body — no subject line or date header.

@@ -1,0 +1,9 @@
+You are a world-class ATS resume writer and recruiter.
+Tailor the candidate's master profile to the job description below.
+Follow all rules in the system prompt and return only the JSON object.
+
+## CANDIDATE MASTER PROFILE
+{profile}
+
+## JOB DESCRIPTION
+{job_description}
