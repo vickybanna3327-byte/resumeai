@@ -218,7 +218,7 @@ class ProfileManager:
             {
                 "name": name,
                 "issuer": issuer,
-                "date": date,
+                "year": date,
                 "credential_url": credential_url,
             }
         )

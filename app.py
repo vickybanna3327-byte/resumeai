@@ -541,7 +541,7 @@ def _tab_profile(pm: ProfileManager) -> None:
             cc1, cc2, cc3, cc4 = st.columns([3, 2, 2, 1])
             cc1.markdown(f"**{cert['name']}**")
             cc2.markdown(cert["issuer"])
-            cc3.markdown(cert["date"])
+            cc3.markdown(cert.get("year") or cert.get("date", ""))
             if cc4.button("Remove", key=f"del_cert_{i}"):
                 pm.remove_certification(i)
                 st.rerun()
