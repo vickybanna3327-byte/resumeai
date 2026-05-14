@@ -1,16 +1,20 @@
+# nest_asyncio MUST be the very first executable lines — before asyncio is
+# imported — so it patches the event loop class before Streamlit creates one.
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass  # Playwright will raise a clear error later if truly missing
+
 """Searches multiple job boards for Canadian job postings.
 
 Sources
 -------
-indeed   — ca.indeed.com/rss  (RSS/XML via urllib with Referer header, no cookies)
-jobbank  — jobbank.gc.ca/jobsearch/rss  (Government of Canada, completely public)
-adzuna   — api.adzuna.com/v1/api/jobs/ca  (Free JSON API, requires free key)
+jobbank  — jobbank.gc.ca/jobsearch  (Government of Canada HTML, post-filtered by province)
+jooble   — jooble.org/api  (free API key, aggregates Indeed + others)
+adzuna   — api.adzuna.com/v1/api/jobs/ca  (free API key, rich salary data)
 linkedin — Playwright + nest_asyncio  (handles Streamlit's running event loop)
 """
-# nest_asyncio MUST be imported and applied before asyncio so that Playwright
-# can run inside Streamlit's already-running event loop on Windows.
-import nest_asyncio
-nest_asyncio.apply()
 
 import asyncio
 import gzip
@@ -35,6 +39,7 @@ from modules.database import get_connection, init_db
 INDEED_BASE   = "https://ca.indeed.com"
 JOBBANK_BASE  = "https://www.jobbank.gc.ca"
 ADZUNA_BASE   = "https://api.adzuna.com/v1/api/jobs/ca"
+JOOBLE_BASE   = "https://jooble.org/api"
 LINKEDIN_BASE = "https://www.linkedin.com"
 
 USER_AGENTS = [
@@ -71,10 +76,12 @@ class JobSearcher:
         headless: bool = True,
         adzuna_app_id: str = "",
         adzuna_app_key: str = "",
+        jooble_api_key: str = "",
     ):
-        self.headless       = headless
-        self.adzuna_app_id  = adzuna_app_id
-        self.adzuna_app_key = adzuna_app_key
+        self.headless        = headless
+        self.adzuna_app_id   = adzuna_app_id
+        self.adzuna_app_key  = adzuna_app_key
+        self.jooble_api_key  = jooble_api_key
         self._errors: list[str] = []
         init_db()
 
@@ -99,6 +106,7 @@ class JobSearcher:
         dispatch = {
             "jobbank": self._jobbank_search_html,
             "adzuna":  self._adzuna_search,
+            "jooble":  self._jooble_search,
         }
 
         for source in sources:
@@ -164,15 +172,20 @@ class JobSearcher:
         Scrape Canada Job Bank search results page — Government of Canada data.
         RSS endpoint is 404 (deprecated); the HTML search page returns 200.
         Pagination via &pg= parameter. SSL verification disabled (cert chain issue).
+        Province filter via &fprov=AB — post-filtered to ensure locality.
         """
-        city = location.split(",")[0].strip()
+        city           = location.split(",")[0].strip()
+        fprov          = _extract_province_code(location)
+        location_terms = _build_location_terms(city, fprov)
         jobs: list[dict] = []
 
         for page_num in range(max_pages):
+            fprov_param = f"&fprov={fprov}" if fprov else ""
             url = (
                 f"{JOBBANK_BASE}/jobsearch/jobsearch?"
                 f"searchstring={quote_plus(query)}"
                 f"&locationstring={quote_plus(city)}"
+                f"{fprov_param}"
                 f"&pg={page_num + 1}"
             )
             print(f"[jobbank-html] Page {page_num + 1}: {url}")
@@ -192,7 +205,7 @@ class JobSearcher:
 
                 for card in cards:
                     job = self._parse_jobbank_card(card)
-                    if job:
+                    if job and _location_matches(job["location"], location_terms):
                         jobs.append(job)
 
                 if len(cards) < 10:
@@ -337,6 +350,61 @@ class JobSearcher:
 
             except Exception as exc:
                 self._errors.append(f"[adzuna] {type(exc).__name__}: {exc}")
+                break
+
+        return jobs
+
+    # ──────────────────────────────── Jooble API ─────────────────────────────
+
+    def _jooble_search(self, query: str, location: str, max_pages: int) -> list[dict]:
+        """
+        Jooble free API — aggregates Indeed, LinkedIn, and other job boards.
+        Register for a free key at: https://jooble.org/api
+        POST JSON body: {"keywords": ..., "location": ..., "page": N}
+        """
+        if not self.jooble_api_key:
+            self._errors.append(
+                "[jooble] API key not set. "
+                "Register free at jooble.org/api, then add the key in Settings."
+            )
+            return []
+
+        city = location.split(",")[0].strip()
+        jobs: list[dict] = []
+
+        for page_num in range(max_pages):
+            url     = f"{JOOBLE_BASE}/{self.jooble_api_key}"
+            payload = {"keywords": query, "location": city, "page": page_num + 1}
+            print(f"[jooble] Page {page_num + 1}: POST {url}")
+
+            try:
+                resp = requests.post(url, json=payload, timeout=20)
+                if resp.status_code in (400, 403):
+                    self._errors.append(
+                        f"[jooble] HTTP {resp.status_code} — Invalid API key. "
+                        "Check your key in Settings."
+                    )
+                    break
+                resp.raise_for_status()
+                data    = resp.json()
+                results = data.get("jobs", [])
+                print(f"[jooble] {len(results)} results on page {page_num + 1}")
+
+                if not results:
+                    break
+
+                for item in results:
+                    job = _jooble_item_to_job(item)
+                    if job:
+                        jobs.append(job)
+
+                if len(results) < 10:
+                    break
+
+                time.sleep(random.uniform(0.5, 1.2))
+
+            except Exception as exc:
+                self._errors.append(f"[jooble] {type(exc).__name__}: {exc}")
                 break
 
         return jobs
@@ -852,6 +920,74 @@ async def _text(page_or_card, selector_list: list[str]) -> str:
         except Exception:
             pass
     return ""
+
+
+# ─────────────────────── Province / location helpers ─────────────────────────
+
+_PROVINCE_CODES: dict[str, str] = {
+    "alberta": "AB", "british columbia": "BC", "ontario": "ON",
+    "quebec": "QC", "nova scotia": "NS", "new brunswick": "NB",
+    "manitoba": "MB", "saskatchewan": "SK",
+    "newfoundland and labrador": "NL", "newfoundland": "NL",
+    "prince edward island": "PE", "northwest territories": "NT",
+    "nunavut": "NU", "yukon": "YT",
+}
+_PROVINCE_NAMES: dict[str, str] = {
+    "AB": "Alberta", "BC": "British Columbia", "ON": "Ontario",
+    "QC": "Quebec", "NS": "Nova Scotia", "NB": "New Brunswick",
+    "MB": "Manitoba", "SK": "Saskatchewan", "NL": "Newfoundland",
+    "PE": "Prince Edward Island", "NT": "Northwest Territories",
+    "NU": "Nunavut", "YT": "Yukon",
+}
+
+
+def _extract_province_code(location: str) -> str:
+    """Return 2-letter province code from e.g. 'Edmonton, AB' or 'Edmonton, Alberta'."""
+    parts = [p.strip() for p in location.split(",")]
+    for part in reversed(parts):
+        if len(part) == 2 and part.upper() in _PROVINCE_NAMES:
+            return part.upper()
+        if part.lower() in _PROVINCE_CODES:
+            return _PROVINCE_CODES[part.lower()]
+    return ""
+
+
+def _build_location_terms(city: str, fprov: str) -> list[str]:
+    """Return terms any one of which must appear in a job's location string."""
+    terms = [city]
+    if fprov:
+        terms.append(fprov)
+        prov_name = _PROVINCE_NAMES.get(fprov, "")
+        if prov_name:
+            terms.append(prov_name)
+    return terms
+
+
+def _location_matches(job_location: str, location_terms: list[str]) -> bool:
+    """True if any location term appears (case-insensitive) in job_location."""
+    if not location_terms:
+        return True
+    loc_lower = job_location.lower()
+    return any(term.lower() in loc_lower for term in location_terms)
+
+
+# ──────────────────────────── Jooble item converter ──────────────────────────
+
+def _jooble_item_to_job(item: dict) -> dict | None:
+    title = _clean(item.get("title", ""))
+    url   = item.get("link", "") or str(item.get("id", ""))
+    if not title or not url:
+        return None
+    return {
+        "title":       title,
+        "company":     _clean(item.get("company", "")),
+        "location":    _clean(item.get("location", "")),
+        "salary":      _clean(item.get("salary", "")),
+        "date_posted": (item.get("updated", "") or "")[:10],
+        "url":         url,
+        "source":      "jooble",
+        "description": _clean(item.get("snippet", "")),
+    }
 
 
 def _clean(text: str | None) -> str:

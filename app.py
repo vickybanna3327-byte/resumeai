@@ -33,8 +33,10 @@ DEFAULT_SETTINGS: dict = {
     "sources_jobbank":    True,
     "sources_linkedin":   False,
     "sources_adzuna":     False,
+    "sources_jooble":     False,
     "adzuna_app_id":      "",
     "adzuna_app_key":     "",
+    "jooble_api_key":     "",
     "max_search_pages":   2,
     "indeed_email":       "",
     "indeed_password":    "",
@@ -583,11 +585,12 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
         sc1, sc2 = st.columns([3, 2])
         query    = sc1.text_input("Job Title / Keywords *", placeholder="e.g. Data Analyst")
         location = sc2.text_input("Location", value="Edmonton, AB", placeholder="Edmonton, AB")
-        fc1, fc2, fc3, fc4 = st.columns(4)
+        fc1, fc2, fc3, fc4, fc5 = st.columns(5)
         use_indeed   = fc1.checkbox("Indeed (RSS)",      value=settings.get("sources_indeed",   True))
         use_jobbank  = fc2.checkbox("Job Bank Canada",   value=settings.get("sources_jobbank",  True))
         use_linkedin = fc3.checkbox("LinkedIn",          value=settings.get("sources_linkedin", False))
         use_adzuna   = fc4.checkbox("Adzuna",            value=settings.get("sources_adzuna",   False))
+        use_jooble   = fc5.checkbox("Jooble",            value=settings.get("sources_jooble",   False))
         fp1, fp2 = st.columns(2)
         max_pages = fp1.slider("Pages per source", 1, 5, int(settings.get("max_search_pages", 2)))
         headless  = fp2.checkbox("Headless browser (LinkedIn)", value=True)
@@ -603,6 +606,7 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
             if use_jobbank:  sources.append("jobbank")
             if use_linkedin: sources.append("linkedin")
             if use_adzuna:   sources.append("adzuna")
+            if use_jooble:   sources.append("jooble")
             if not sources:
                 st.error("Select at least one job board.")
             else:
@@ -613,6 +617,7 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
                             headless=headless,
                             adzuna_app_id=settings.get("adzuna_app_id", ""),
                             adzuna_app_key=settings.get("adzuna_app_key", ""),
+                            jooble_api_key=settings.get("jooble_api_key", ""),
                         )
                         jobs = searcher.search(query, location,
                                                sources=sources, max_pages=max_pages)
@@ -1263,23 +1268,39 @@ def _tab_settings(settings: dict) -> dict:
         # ── Search defaults ───────────────────────────────────────────────────
         st.markdown('<div class="section-title">Search Sources</div>',
                     unsafe_allow_html=True)
-        sd1, sd2, sd3, sd4 = st.columns(4)
+        sd1, sd2, sd3, sd4, sd5 = st.columns(5)
         src_indeed   = sd1.checkbox("Indeed (RSS)",    value=settings.get("sources_indeed",   True))
         src_jobbank  = sd2.checkbox("Job Bank Canada", value=settings.get("sources_jobbank",  True))
         src_linkedin = sd3.checkbox("LinkedIn",        value=settings.get("sources_linkedin", False))
         src_adzuna   = sd4.checkbox("Adzuna",          value=settings.get("sources_adzuna",   False))
+        src_jooble   = sd5.checkbox("Jooble",          value=settings.get("sources_jooble",   False))
         max_pages    = st.slider("Pages per source", 1, 5, int(settings.get("max_search_pages", 2)))
 
         st.markdown('<div class="section-title">Adzuna API (Free)</div>',
                     unsafe_allow_html=True)
         st.caption(
-            "Free API for Canadian job listings. Register at "
-            "[developer.adzuna.com](https://developer.adzuna.com/) — no credit card required."
+            "Free API for Canadian job listings — no credit card required. "
+            "Get your free API key at [developer.adzuna.com](https://developer.adzuna.com/) "
+            "— takes 2 minutes."
         )
         az1, az2 = st.columns(2)
         adzuna_app_id  = az1.text_input("Adzuna App ID",  value=settings.get("adzuna_app_id",  ""), key="s_az_id")
         adzuna_app_key = az2.text_input("Adzuna App Key", value=settings.get("adzuna_app_key", ""),
                                          type="password", key="s_az_key")
+
+        st.markdown('<div class="section-title">Jooble API (Free)</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Aggregates Indeed, LinkedIn, and more into one free API — no credit card required. "
+            "Get your free API key at [jooble.org/api](https://jooble.org/api) "
+            "— takes 2 minutes."
+        )
+        jooble_api_key = st.text_input(
+            "Jooble API Key",
+            value=settings.get("jooble_api_key", ""),
+            type="password",
+            key="s_jooble_key",
+        )
 
         if st.form_submit_button("Save Settings", type="primary", use_container_width=True):
             new_settings = {
@@ -1297,8 +1318,10 @@ def _tab_settings(settings: dict) -> dict:
                 "sources_jobbank":    src_jobbank,
                 "sources_linkedin":   src_linkedin,
                 "sources_adzuna":     src_adzuna,
+                "sources_jooble":     src_jooble,
                 "adzuna_app_id":      adzuna_app_id,
                 "adzuna_app_key":     adzuna_app_key,
+                "jooble_api_key":     jooble_api_key,
                 "max_search_pages":   max_pages,
             }
             _save_settings(new_settings)
