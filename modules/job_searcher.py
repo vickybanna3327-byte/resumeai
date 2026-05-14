@@ -6,29 +6,25 @@ indeed   — ca.indeed.com/rss  (RSS/XML via urllib with Referer header, no cook
 jobbank  — jobbank.gc.ca/jobsearch/rss  (Government of Canada, completely public)
 adzuna   — api.adzuna.com/v1/api/jobs/ca  (Free JSON API, requires free key)
 linkedin — Playwright + nest_asyncio  (handles Streamlit's running event loop)
-
-All HTTP sources use urllib with a Referer: https://www.google.com/ header and
-a fresh connection per request (no session cookies that Indeed could fingerprint).
 """
+# nest_asyncio MUST be imported and applied before asyncio so that Playwright
+# can run inside Streamlit's already-running event loop on Windows.
+import nest_asyncio
+nest_asyncio.apply()
+
 import asyncio
 import gzip
-import json
 import random
 import re
+import ssl
 import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import requests
 from bs4 import BeautifulSoup
-
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:
-    pass
 
 from playwright.async_api import BrowserContext, Page, async_playwright
 
@@ -101,14 +97,22 @@ class JobSearcher:
         all_jobs: list[dict] = []
 
         dispatch = {
-            "indeed":   self._indeed_search_rss,
-            "jobbank":  self._jobbank_search_rss,
-            "adzuna":   self._adzuna_search,
+            "jobbank": self._jobbank_search_html,
+            "adzuna":  self._adzuna_search,
         }
 
         for source in sources:
             if source == "linkedin":
                 continue  # handled separately below (needs async)
+            if source == "indeed":
+                # Indeed.com returns 403 on every endpoint (HTML, RSS, API).
+                # Adzuna aggregates Indeed-sourced listings via its free API.
+                self._errors.append(
+                    "[indeed] Indeed.com blocks all automated requests (HTTP 403 on "
+                    "all endpoints including RSS). Enable Adzuna in Settings — it "
+                    "surfaces Indeed-sourced jobs via its free API."
+                )
+                continue
             handler = dispatch.get(source)
             if not handler:
                 continue
@@ -118,8 +122,8 @@ class JobSearcher:
                 print(f"[{source}] {len(jobs)} jobs")
                 if not jobs:
                     self._errors.append(
-                        f"[{source}] 0 results — feed may be empty for this "
-                        "query/location, or the source is temporarily unavailable."
+                        f"[{source}] 0 results — query may return no matches "
+                        "for this location, or the source is temporarily unavailable."
                     )
             except Exception as exc:
                 self._errors.append(
@@ -145,11 +149,7 @@ class JobSearcher:
 
     def get_job_details(self, url: str) -> dict:
         """Fetch the full job description for a single listing."""
-        if "indeed.com" in url:
-            return self._fetch_indeed_details(url)
-        if "jobbank.gc.ca" in url:
-            return self._fetch_generic_details(url)
-        if "adzuna" in url:
+        if "jobbank.gc.ca" in url or "adzuna" in url or "indeed.com" in url:
             return self._fetch_generic_details(url)
         try:
             return self._run_async(self._fetch_details_async(url))
@@ -157,128 +157,107 @@ class JobSearcher:
             self._errors.append(f"[details] {type(exc).__name__}: {exc}")
             return {"url": url, "description": ""}
 
-    # ─────────────────── Indeed RSS (urllib + Referer, no cookies) ───────────
+    # ─────────────────── Canada Job Bank (HTML scraper) ─────────────────────
 
-    def _indeed_search_rss(self, query: str, location: str, max_pages: int) -> list[dict]:
+    def _jobbank_search_html(self, query: str, location: str, max_pages: int) -> list[dict]:
         """
-        Fetch Indeed Canada RSS feed.
-        Using urllib with Referer: google.com and a fresh connection each time
-        (no session/cookie state that Indeed could fingerprint as a bot).
+        Scrape Canada Job Bank search results page — Government of Canada data.
+        RSS endpoint is 404 (deprecated); the HTML search page returns 200.
+        Pagination via &pg= parameter. SSL verification disabled (cert chain issue).
         """
-        jobs: list[dict] = []
-
-        for page_num in range(max_pages):
-            url = (
-                f"{INDEED_BASE}/rss?"
-                f"q={quote_plus(query)}"
-                f"&l={quote_plus(location)}"
-                f"&sort=date"
-                f"&start={page_num * 10}"
-            )
-            print(f"[indeed-rss] Page {page_num + 1}: {url}")
-
-            try:
-                content = _fetch_urllib(url)
-                items   = _parse_rss_xml(content)
-                print(f"[indeed-rss] {len(items)} items on page {page_num + 1}")
-
-                if not items:
-                    self._errors.append(
-                        f"[indeed] Page {page_num + 1} — feed returned 0 items. "
-                        "RSS may be geo-blocked or the query returned no results."
-                    )
-                    break
-
-                for raw in items:
-                    job = _indeed_rss_to_job(raw, location)
-                    if job:
-                        jobs.append(job)
-
-                if len(items) < 10:
-                    break
-
-                time.sleep(random.uniform(1.5, 3.0))
-
-            except urllib.error.HTTPError as exc:
-                self._errors.append(
-                    f"[indeed-rss] HTTP {exc.code} — "
-                    + ("RSS feed is blocked in this region." if exc.code == 403 else str(exc))
-                )
-                break
-            except Exception as exc:
-                self._errors.append(f"[indeed-rss] {type(exc).__name__}: {exc}")
-                break
-
-        return jobs
-
-    def _fetch_indeed_details(self, url: str) -> dict:
-        """Fetch a full Indeed job description via urllib."""
-        description = ""
-        try:
-            content = _fetch_urllib(url)
-            soup    = BeautifulSoup(content, "html.parser")
-            desc_el = soup.select_one(
-                "#jobDescriptionText, "
-                "[data-testid='jobDescriptionText'], "
-                "div.jobsearch-JobComponent-description"
-            )
-            if desc_el:
-                description = _clean(desc_el.get_text(separator=" "))
-        except Exception as exc:
-            print(f"[indeed-details] {exc}")
-
-        if description:
-            _update_description(url, description)
-        return {"url": url, "description": description}
-
-    # ───────────────────── Canada Job Bank RSS (Government) ──────────────────
-
-    def _jobbank_search_rss(self, query: str, location: str, max_pages: int) -> list[dict]:
-        """
-        Canada Job Bank public RSS feed — Government of Canada data.
-        No authentication, no rate limiting, completely open.
-        URL: jobbank.gc.ca/jobsearch/rss?searchstring=...&locationstring=...
-        """
-        # Job Bank wants just the city name, not "City, Province, Country"
         city = location.split(",")[0].strip()
         jobs: list[dict] = []
 
         for page_num in range(max_pages):
             url = (
-                f"{JOBBANK_BASE}/jobsearch/rss?"
+                f"{JOBBANK_BASE}/jobsearch/jobsearch?"
                 f"searchstring={quote_plus(query)}"
                 f"&locationstring={quote_plus(city)}"
-                f"&mid="
                 f"&pg={page_num + 1}"
             )
-            print(f"[jobbank-rss] Page {page_num + 1}: {url}")
+            print(f"[jobbank-html] Page {page_num + 1}: {url}")
 
             try:
                 content = _fetch_urllib(
                     url,
                     extra_headers={"Referer": f"{JOBBANK_BASE}/jobsearch/jobsearch"},
+                    verify_ssl=False,
                 )
-                items = _parse_rss_xml(content)
-                print(f"[jobbank-rss] {len(items)} items on page {page_num + 1}")
+                soup  = BeautifulSoup(content, "html.parser")
+                cards = soup.select("article.action-buttons")
+                print(f"[jobbank-html] {len(cards)} cards on page {page_num + 1}")
 
-                if not items:
+                if not cards:
                     break
 
-                for raw in items:
-                    job = _jobbank_rss_to_job(raw)
+                for card in cards:
+                    job = self._parse_jobbank_card(card)
                     if job:
                         jobs.append(job)
 
-                if len(items) < 10:
+                if len(cards) < 10:
                     break
 
-                time.sleep(random.uniform(0.8, 1.8))
+                time.sleep(random.uniform(1.0, 2.0))
 
             except Exception as exc:
-                self._errors.append(f"[jobbank-rss] {type(exc).__name__}: {exc}")
+                self._errors.append(f"[jobbank] {type(exc).__name__}: {exc}")
                 break
 
         return jobs
+
+    def _parse_jobbank_card(self, card) -> dict | None:
+        try:
+            link_el = card.select_one("a.resultJobItem")
+            if not link_el:
+                return None
+
+            # URL: strip jsessionid from href and build clean canonical URL
+            # e.g. /jobsearch/jobposting/49507161;jsessionid=...?source=... → /jobposting/49507161
+            href = link_el.get("href", "")
+            m = re.search(r"/jobposting/(\d+)", href)
+            if not m:
+                return None
+            url = f"{JOBBANK_BASE}/jobsearch/jobposting/{m.group(1)}"
+
+            title_el = link_el.select_one(".noctitle")
+            title = _clean(title_el.get_text()) if title_el else ""
+            if not title:
+                return None
+
+            company_el = card.select_one("li.business")
+            company    = _clean(company_el.get_text()) if company_el else ""
+
+            loc_el  = card.select_one("li.location")
+            location = ""
+            if loc_el:
+                for s in loc_el.select(".wb-inv, .fas, .fa"):
+                    s.decompose()
+                location = _clean(loc_el.get_text())
+
+            sal_el = card.select_one("li.salary")
+            salary = ""
+            if sal_el:
+                for s in sal_el.select(".wb-inv, .fas, .fa"):
+                    s.decompose()
+                salary = _clean(sal_el.get_text()).removeprefix("Salary").strip()
+
+            date_el    = card.select_one("li.date")
+            date_posted = _clean(date_el.get_text()) if date_el else ""
+
+            return {
+                "title":       title,
+                "company":     company,
+                "location":    location,
+                "salary":      salary,
+                "date_posted": date_posted,
+                "url":         url,
+                "source":      "jobbank",
+                "description": "",
+            }
+        except Exception as exc:
+            print(f"[jobbank] Card parse error: {exc}")
+            return None
 
     def _fetch_generic_details(self, url: str) -> dict:
         """Generic description fetch via urllib + BeautifulSoup."""
@@ -539,11 +518,12 @@ class JobSearcher:
 
 # ─────────────────────────── urllib fetch helper ─────────────────────────────
 
-def _fetch_urllib(url: str, extra_headers: dict | None = None) -> bytes:
+def _fetch_urllib(url: str, extra_headers: dict | None = None, verify_ssl: bool = True) -> bytes:
     """
     Fetch a URL with browser-like headers via urllib.
     Fresh connection every call — no session cookies.
     Referer set to google.com so the request looks like organic traffic.
+    Set verify_ssl=False for government sites with broken cert chains.
     """
     headers = {
         "User-Agent":      random.choice(USER_AGENTS),
@@ -558,7 +538,16 @@ def _fetch_urllib(url: str, extra_headers: dict | None = None) -> bytes:
         headers.update(extra_headers)
 
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=20) as resp:
+
+    # SSL context: skip verification for sites with self-signed / broken chains
+    if not verify_ssl:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx = None
+
+    with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
         raw = resp.read()
         if resp.headers.get("Content-Encoding") == "gzip":
             raw = gzip.decompress(raw)
@@ -869,3 +858,73 @@ def _clean(text: str | None) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", text).strip()
+
+
+# ───────────────────────────── Source connectivity test ──────────────────────
+
+def _test_sources(query: str = "data analyst", location: str = "Edmonton, AB") -> None:
+    """
+    Quick connectivity check for every HTTP job source.
+    Prints a one-line result per source so you can see which ones work.
+    Run from the project root:  python -c "from modules.job_searcher import _test_sources; _test_sources()"
+    """
+    sep = "-" * 60
+    print(f"\n{sep}")
+    print(f"  ResumeAI source test  |  query={query!r}  location={location!r}")
+    print(sep)
+
+    searcher = JobSearcher()
+
+    # ── Indeed (expected: blocked) ────────────────────────────────────────────
+    try:
+        req = urllib.request.Request(
+            f"{INDEED_BASE}/rss?q={quote_plus(query)}&l={quote(location, safe='')}",
+            headers={"User-Agent": USER_AGENTS[0], "Referer": "https://www.google.com/"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print(f"  [indeed]       UNEXPECTED OK — HTTP {r.status} (blocked expected)")
+    except urllib.error.HTTPError as e:
+        print(f"  [indeed]       BLOCKED — HTTP {e.code} (use Adzuna for Indeed-sourced jobs)")
+    except Exception as e:
+        print(f"  [indeed]       FAIL — {type(e).__name__}: {e}")
+
+    # ── Canada Job Bank (HTML scraper) ────────────────────────────────────────
+    try:
+        city = location.split(",")[0].strip()
+        url  = (
+            f"{JOBBANK_BASE}/jobsearch/jobsearch?"
+            f"searchstring={quote_plus(query)}&locationstring={quote_plus(city)}&pg=1"
+        )
+        content = _fetch_urllib(url, verify_ssl=False)
+        soup    = BeautifulSoup(content, "html.parser")
+        cards   = soup.select("article.action-buttons")
+        if cards:
+            title = _clean(cards[0].select_one(".noctitle").get_text()) if cards[0].select_one(".noctitle") else "?"
+            print(f"  [jobbank-html] OK  — {len(cards)} cards  |  first: {title!r}")
+        else:
+            print(f"  [jobbank-html] WARN — 0 cards (no results for this query/location)")
+    except Exception as e:
+        print(f"  [jobbank-html] FAIL — {type(e).__name__}: {e}")
+
+    # ── Adzuna API ────────────────────────────────────────────────────────────
+    try:
+        url  = (
+            f"{ADZUNA_BASE}/search/1?"
+            f"app_id=TEST&app_key=TEST"
+            f"&results_per_page=5"
+            f"&what={quote_plus(query)}"
+            f"&where={quote_plus(location.split(',')[0])}"
+            f"&content-type=application/json"
+        )
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 401:
+            print(f"  [adzuna]       OK  — API reachable (401 expected w/ test keys; add real keys in Settings)")
+        elif resp.status_code == 200:
+            n = len(resp.json().get("results", []))
+            print(f"  [adzuna]       OK  — {n} results")
+        else:
+            print(f"  [adzuna]       WARN — HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"  [adzuna]       FAIL — {type(e).__name__}: {e}")
+
+    print(sep + "\n")
