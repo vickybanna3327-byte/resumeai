@@ -1,5 +1,6 @@
 """ResumeAI — Autonomous Job Application Agent · Streamlit UI"""
 import json
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -605,9 +606,23 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
                                                sources=sources, max_pages=max_pages)
                         st.session_state["search_results"] = jobs
                         st.session_state["search_query"]   = query
-                        st.success(f"Found {len(jobs)} jobs.")
+                        if jobs:
+                            st.success(f"Found {len(jobs)} jobs.")
+                        else:
+                            st.warning("Search completed but returned 0 jobs.")
+                        # Surface any non-fatal scraper warnings
+                        for err_msg in searcher.errors:
+                            if "fallback" in err_msg.lower() and "fetched" in err_msg.lower():
+                                st.info(err_msg)
+                            else:
+                                st.warning(err_msg)
                     except Exception as exc:
-                        st.error(f"Search error: {exc}")
+                        full_tb = traceback.format_exc()
+                        st.error(
+                            f"Search error — **{type(exc).__name__}**: {exc}"
+                        )
+                        with st.expander("Full traceback"):
+                            st.code(full_tb, language="text")
 
     # ── Results ───────────────────────────────────────────────────────────────
     jobs = st.session_state.get("search_results", [])

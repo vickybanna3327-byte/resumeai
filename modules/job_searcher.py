@@ -3,10 +3,15 @@
 Human-like browser behaviour (random delays, incremental scrolling, stealth JS)
 minimises bot-detection. Both scrapers handle pagination automatically.
 Results are deduplicated by URL and persisted to SQLite.
+
+If Playwright/Chromium fails to launch, Indeed scraping falls back to
+requests + BeautifulSoup automatically.
 """
 import asyncio
 import random
 import re
+import sys
+import traceback
 from urllib.parse import quote_plus
 
 from playwright.async_api import BrowserContext, Page, async_playwright
@@ -55,7 +60,12 @@ class JobSearcher:
 
     def __init__(self, headless: bool = True):
         self.headless = headless
+        self._errors: list[str] = []
         init_db()
+
+    @property
+    def errors(self) -> list[str]:
+        return list(self._errors)
 
     # ─────────────────────────── Public sync interface ───────────────────────
 
@@ -67,6 +77,10 @@ class JobSearcher:
         max_pages: int = 3,
     ) -> list[dict]:
         """Search job boards and return saved job dicts."""
+        self._errors = []
+        # On Windows the default ProactorEventLoop is incompatible with Playwright
+        if sys.platform == "win32":
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         return asyncio.run(
             self.search_async(query, location, sources, max_pages)
         )
@@ -86,32 +100,64 @@ class JobSearcher:
     ) -> list[dict]:
         sources = sources or ["indeed", "linkedin"]
         all_jobs: list[dict] = []
+        playwright_ok = False
 
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=self.headless,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ],
+            # ── Try launching Chromium ────────────────────────────────────────
+            browser = None
+            try:
+                browser = await pw.chromium.launch(
+                    headless=self.headless,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+                playwright_ok = True
+            except Exception as exc:
+                err = (
+                    f"Chromium launch failed — {type(exc).__name__}: {exc}\n"
+                    "Fix: run  playwright install chromium  in your terminal."
+                )
+                self._errors.append(err)
+                print(f"[playwright] {err}")
+
+            # ── Playwright scraping (only if browser launched) ────────────────
+            if browser is not None:
+                context = await _new_context(browser)
+                for source in sources:
+                    try:
+                        if source == "indeed":
+                            jobs = await self._scrape_indeed(context, query, location, max_pages)
+                        elif source == "linkedin":
+                            jobs = await self._scrape_linkedin(context, query, location, max_pages)
+                        else:
+                            continue
+                        print(f"[{source}] Found {len(jobs)} jobs")
+                        all_jobs.extend(jobs)
+                    except Exception as exc:
+                        msg = f"[{source}] Scraper error — {type(exc).__name__}: {exc}"
+                        self._errors.append(msg)
+                        print(msg)
+                await browser.close()
+
+        # ── BS4 fallback for Indeed when Playwright couldn't launch ──────────
+        if not playwright_ok and "indeed" in sources:
+            self._errors.append(
+                "[indeed] Playwright unavailable — trying requests+BeautifulSoup fallback..."
             )
-            context = await _new_context(browser)
-
-            for source in sources:
-                try:
-                    if source == "indeed":
-                        jobs = await self._scrape_indeed(context, query, location, max_pages)
-                    elif source == "linkedin":
-                        jobs = await self._scrape_linkedin(context, query, location, max_pages)
-                    else:
-                        continue
-                    print(f"[{source}] Found {len(jobs)} jobs")
-                    all_jobs.extend(jobs)
-                except Exception as exc:
-                    print(f"[{source}] Scraper error: {exc}")
-
-            await browser.close()
+            try:
+                fallback_jobs = self._indeed_search_bs4(query, location, max_pages)
+                all_jobs.extend(fallback_jobs)
+                self._errors.append(
+                    f"[indeed-fallback] Fetched {len(fallback_jobs)} jobs via requests+BeautifulSoup"
+                )
+                print(f"[indeed-fallback] {len(fallback_jobs)} jobs")
+            except Exception as exc:
+                msg = f"[indeed-fallback] Failed — {type(exc).__name__}: {exc}"
+                self._errors.append(msg)
+                print(msg)
 
         saved = _save_to_db(all_jobs)
         print(f"[db] Saved/updated {len(saved)} jobs total")
@@ -372,6 +418,98 @@ class JobSearcher:
         except Exception as exc:
             print(f"[linkedin] Card parse error: {exc}")
             return None
+
+    # ─────────────────────── requests+BS4 Indeed fallback ───────────────────
+
+    def _indeed_search_bs4(self, query: str, location: str, max_pages: int) -> list[dict]:
+        """Synchronous fallback scraper using requests + BeautifulSoup."""
+        import requests
+        from bs4 import BeautifulSoup
+
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Language": "en-CA,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        jobs: list[dict] = []
+
+        for page_num in range(max_pages):
+            url = (
+                f"{INDEED_BASE}/jobs?"
+                f"q={quote_plus(query)}"
+                f"&l={quote_plus(location)}"
+                f"&sort=date"
+                f"&start={page_num * 10}"
+            )
+            print(f"[indeed-bs4] Page {page_num + 1}: {url}")
+            try:
+                resp = requests.get(url, headers=headers, timeout=20)
+                soup = BeautifulSoup(resp.text, "html.parser")
+
+                cards = soup.select(
+                    "div.job_seen_beacon, div[data-testid='slider_item'], li.css-1ac2h1w"
+                )
+                if not cards:
+                    print(f"[indeed-bs4] No cards on page {page_num + 1}")
+                    break
+
+                for card in cards:
+                    try:
+                        title_el = card.select_one(
+                            "h2[data-testid='jobTitle'] a, a.jcs-JobTitle, "
+                            "h2.jobTitle a, a[id^='jobTitle']"
+                        )
+                        if not title_el:
+                            continue
+                        title = title_el.get_text(strip=True)
+
+                        jk = card.get("data-jk", "")
+                        href = title_el.get("href", "")
+                        if jk:
+                            job_url = f"{INDEED_BASE}/viewjob?jk={jk}"
+                        elif href:
+                            job_url = f"{INDEED_BASE}{href}" if href.startswith("/") else href
+                        else:
+                            continue
+
+                        company_el = card.select_one(
+                            "[data-testid='company-name'], span.companyName, .css-63koeb"
+                        )
+                        loc_el = card.select_one(
+                            "[data-testid='text-location'], div.companyLocation, .css-1p0sjhy"
+                        )
+                        salary_el = card.select_one(
+                            "[data-testid='attribute_snippet_testid'], "
+                            "div.salary-snippet-container"
+                        )
+                        date_el = card.select_one(
+                            "[data-testid='myJobsStateDate'], span.date, .css-qvloho"
+                        )
+
+                        jobs.append({
+                            "title":       title,
+                            "company":     company_el.get_text(strip=True) if company_el else "",
+                            "location":    loc_el.get_text(strip=True) if loc_el else "",
+                            "salary":      salary_el.get_text(strip=True) if salary_el else "",
+                            "date_posted": date_el.get_text(strip=True) if date_el else "",
+                            "url":         job_url,
+                            "source":      "indeed",
+                            "description": "",
+                        })
+                    except Exception:
+                        continue
+
+                next_btn = soup.select_one(
+                    "a[data-testid='pagination-page-next'], a[aria-label='Next Page']"
+                )
+                if not next_btn:
+                    break
+
+            except Exception as exc:
+                self._errors.append(f"[indeed-bs4] Page {page_num + 1} error: {exc}")
+                break
+
+        return jobs
 
     # ─────────────────────────── Job detail fetch ────────────────────────────
 
