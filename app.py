@@ -731,7 +731,7 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
 
     st.markdown("---")
 
-    for job in jobs:
+    for i, job in enumerate(jobs):
         if source_filter != "All" and job.get("source", "") != source_filter:
             continue
         if status_filter != "All" and job.get("status", "new") != status_filter:
@@ -770,7 +770,7 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
                 )
 
             # Fetch description
-            if btn_c2.button("Fetch Description", key=f"fetch_{job_key}"):
+            if btn_c2.button("Fetch Description", key=f"fetch_{i}_{job_key}"):
                 with st.spinner("Fetching full job description..."):
                     try:
                         from modules.job_searcher import JobSearcher
@@ -790,7 +790,7 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
                 else "Fetch description first" if not job.get("description")
                 else "Generate ATS-optimized resume with Claude"
             )
-            if btn_c3.button("Tailor Resume", key=f"tailor_{job_key}",
+            if btn_c3.button("Tailor Resume", key=f"tailor_{i}_{job_key}",
                               disabled=tailor_disabled, help=tailor_help):
                 with st.spinner("Calling Claude to tailor your resume..."):
                     try:
@@ -827,18 +827,18 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
                         "Download DOCX", data=Path(docx_path).read_bytes(),
                         file_name=f"resume_{job.get('company','')}.docx",
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key=f"dl_docx_{job_key}",
+                        key=f"dl_docx_{i}_{job_key}",
                     )
                 if pdf_path and Path(pdf_path).exists():
                     dl2.download_button(
                         "Download PDF", data=Path(pdf_path).read_bytes(),
                         file_name=f"resume_{job.get('company','')}.pdf",
                         mime="application/pdf",
-                        key=f"dl_pdf_{job_key}",
+                        key=f"dl_pdf_{i}_{job_key}",
                     )
 
                 # Apply button
-                if btn_c4.button("Apply", key=f"apply_{job_key}",
+                if btn_c4.button("Apply", key=f"apply_{i}_{job_key}",
                                   type="primary",
                                   help="Submit application via Playwright"):
                     _do_apply(job, tailor_result.get("pdf_path", ""),
