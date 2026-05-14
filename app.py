@@ -30,7 +30,11 @@ DEFAULT_SETTINGS: dict = {
     "notice_period":      "2 weeks",
     "willing_to_relocate": False,
     "sources_indeed":     True,
-    "sources_linkedin":   True,
+    "sources_jobbank":    True,
+    "sources_linkedin":   False,
+    "sources_adzuna":     False,
+    "adzuna_app_id":      "",
+    "adzuna_app_key":     "",
     "max_search_pages":   2,
     "indeed_email":       "",
     "indeed_password":    "",
@@ -577,16 +581,18 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
     # ── Search form ───────────────────────────────────────────────────────────
     with st.form("form_search"):
         sc1, sc2 = st.columns([3, 2])
-        query    = sc1.text_input("Job Title / Keywords *", placeholder="e.g. Python Developer")
-        location = sc2.text_input("Location", value="Canada", placeholder="Toronto, ON")
+        query    = sc1.text_input("Job Title / Keywords *", placeholder="e.g. Data Analyst")
+        location = sc2.text_input("Location", value="Edmonton, AB", placeholder="Edmonton, AB")
         fc1, fc2, fc3, fc4 = st.columns(4)
-        use_indeed   = fc1.checkbox("Indeed Canada", value=settings.get("sources_indeed", True))
-        use_linkedin = fc2.checkbox("LinkedIn",      value=settings.get("sources_linkedin", True))
-        max_pages    = fc3.slider("Pages per source", 1, 5,
-                                   int(settings.get("max_search_pages", 2)))
-        headless     = fc4.checkbox("Headless browser", value=True)
-        submitted    = st.form_submit_button("Search Jobs", type="primary",
-                                              use_container_width=True)
+        use_indeed   = fc1.checkbox("Indeed (RSS)",      value=settings.get("sources_indeed",   True))
+        use_jobbank  = fc2.checkbox("Job Bank Canada",   value=settings.get("sources_jobbank",  True))
+        use_linkedin = fc3.checkbox("LinkedIn",          value=settings.get("sources_linkedin", False))
+        use_adzuna   = fc4.checkbox("Adzuna",            value=settings.get("sources_adzuna",   False))
+        fp1, fp2 = st.columns(2)
+        max_pages = fp1.slider("Pages per source", 1, 5, int(settings.get("max_search_pages", 2)))
+        headless  = fp2.checkbox("Headless browser (LinkedIn)", value=True)
+        submitted = st.form_submit_button("Search Jobs", type="primary",
+                                          use_container_width=True)
 
     if submitted:
         if not query:
@@ -594,14 +600,20 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
         else:
             sources = []
             if use_indeed:   sources.append("indeed")
+            if use_jobbank:  sources.append("jobbank")
             if use_linkedin: sources.append("linkedin")
+            if use_adzuna:   sources.append("adzuna")
             if not sources:
                 st.error("Select at least one job board.")
             else:
                 with st.spinner(f"Searching {', '.join(sources)} — this takes 30-90 seconds..."):
                     try:
                         from modules.job_searcher import JobSearcher
-                        searcher = JobSearcher(headless=headless)
+                        searcher = JobSearcher(
+                            headless=headless,
+                            adzuna_app_id=settings.get("adzuna_app_id", ""),
+                            adzuna_app_key=settings.get("adzuna_app_key", ""),
+                        )
                         jobs = searcher.search(query, location,
                                                sources=sources, max_pages=max_pages)
                         st.session_state["search_results"] = jobs
@@ -1249,13 +1261,25 @@ def _tab_settings(settings: dict) -> dict:
                                       type="password", key="s_lp")
 
         # ── Search defaults ───────────────────────────────────────────────────
-        st.markdown('<div class="section-title">Search Defaults</div>',
+        st.markdown('<div class="section-title">Search Sources</div>',
                     unsafe_allow_html=True)
-        sd1, sd2, sd3 = st.columns(3)
-        src_indeed   = sd1.checkbox("Search Indeed",   value=settings.get("sources_indeed", True))
-        src_linkedin = sd2.checkbox("Search LinkedIn", value=settings.get("sources_linkedin", True))
-        max_pages    = sd3.slider("Pages per source", 1, 5,
-                                   int(settings.get("max_search_pages", 2)))
+        sd1, sd2, sd3, sd4 = st.columns(4)
+        src_indeed   = sd1.checkbox("Indeed (RSS)",    value=settings.get("sources_indeed",   True))
+        src_jobbank  = sd2.checkbox("Job Bank Canada", value=settings.get("sources_jobbank",  True))
+        src_linkedin = sd3.checkbox("LinkedIn",        value=settings.get("sources_linkedin", False))
+        src_adzuna   = sd4.checkbox("Adzuna",          value=settings.get("sources_adzuna",   False))
+        max_pages    = st.slider("Pages per source", 1, 5, int(settings.get("max_search_pages", 2)))
+
+        st.markdown('<div class="section-title">Adzuna API (Free)</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Free API for Canadian job listings. Register at "
+            "[developer.adzuna.com](https://developer.adzuna.com/) — no credit card required."
+        )
+        az1, az2 = st.columns(2)
+        adzuna_app_id  = az1.text_input("Adzuna App ID",  value=settings.get("adzuna_app_id",  ""), key="s_az_id")
+        adzuna_app_key = az2.text_input("Adzuna App Key", value=settings.get("adzuna_app_key", ""),
+                                         type="password", key="s_az_key")
 
         if st.form_submit_button("Save Settings", type="primary", use_container_width=True):
             new_settings = {
@@ -1270,7 +1294,11 @@ def _tab_settings(settings: dict) -> dict:
                 "linkedin_email":     li_email,
                 "linkedin_password":  li_password,
                 "sources_indeed":     src_indeed,
+                "sources_jobbank":    src_jobbank,
                 "sources_linkedin":   src_linkedin,
+                "sources_adzuna":     src_adzuna,
+                "adzuna_app_id":      adzuna_app_id,
+                "adzuna_app_key":     adzuna_app_key,
                 "max_search_pages":   max_pages,
             }
             _save_settings(new_settings)
