@@ -34,9 +34,11 @@ DEFAULT_SETTINGS: dict = {
     "sources_linkedin":   False,
     "sources_adzuna":     False,
     "sources_jooble":     False,
+    "sources_jobrapido":  False,
     "adzuna_app_id":      "",
     "adzuna_app_key":     "",
     "jooble_api_key":     "",
+    "jobrapido_api_key":  "",
     "max_search_pages":   2,
     "indeed_email":       "",
     "indeed_password":    "",
@@ -585,12 +587,14 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
         sc1, sc2 = st.columns([3, 2])
         query    = sc1.text_input("Job Title / Keywords *", placeholder="e.g. Data Analyst")
         location = sc2.text_input("Location", value="Edmonton, AB", placeholder="Edmonton, AB")
-        fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-        use_indeed   = fc1.checkbox("Indeed (RSS)",      value=settings.get("sources_indeed",   True))
-        use_jobbank  = fc2.checkbox("Job Bank Canada",   value=settings.get("sources_jobbank",  True))
-        use_linkedin = fc3.checkbox("LinkedIn",          value=settings.get("sources_linkedin", False))
-        use_adzuna   = fc4.checkbox("Adzuna",            value=settings.get("sources_adzuna",   False))
-        use_jooble   = fc5.checkbox("Jooble",            value=settings.get("sources_jooble",   False))
+        fr1c1, fr1c2, fr1c3 = st.columns(3)
+        use_indeed      = fr1c1.checkbox("Indeed (RSS)",     value=settings.get("sources_indeed",    True))
+        use_jobbank     = fr1c2.checkbox("Job Bank Canada",  value=settings.get("sources_jobbank",   True))
+        use_linkedin    = fr1c3.checkbox("LinkedIn",         value=settings.get("sources_linkedin",  False))
+        fr2c1, fr2c2, fr2c3 = st.columns(3)
+        use_adzuna      = fr2c1.checkbox("Adzuna",           value=settings.get("sources_adzuna",    False))
+        use_jooble      = fr2c2.checkbox("Jooble",           value=settings.get("sources_jooble",    False))
+        use_jobrapido   = fr2c3.checkbox("Jobrapido",        value=settings.get("sources_jobrapido", False))
         fp1, fp2 = st.columns(2)
         max_pages = fp1.slider("Pages per source", 1, 5, int(settings.get("max_search_pages", 2)))
         headless  = fp2.checkbox("Headless browser (LinkedIn)", value=True)
@@ -602,11 +606,12 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
             st.error("Please enter a job title or keywords.")
         else:
             sources = []
-            if use_indeed:   sources.append("indeed")
-            if use_jobbank:  sources.append("jobbank")
-            if use_linkedin: sources.append("linkedin")
-            if use_adzuna:   sources.append("adzuna")
-            if use_jooble:   sources.append("jooble")
+            if use_indeed:    sources.append("indeed")
+            if use_jobbank:   sources.append("jobbank")
+            if use_linkedin:  sources.append("linkedin")
+            if use_adzuna:    sources.append("adzuna")
+            if use_jooble:    sources.append("jooble")
+            if use_jobrapido: sources.append("jobrapido")
             if not sources:
                 st.error("Select at least one job board.")
             else:
@@ -618,6 +623,7 @@ def _tab_search(settings: dict, pm: ProfileManager) -> None:
                             adzuna_app_id=settings.get("adzuna_app_id", ""),
                             adzuna_app_key=settings.get("adzuna_app_key", ""),
                             jooble_api_key=settings.get("jooble_api_key", ""),
+                            jobrapido_api_key=settings.get("jobrapido_api_key", ""),
                         )
                         jobs = searcher.search(query, location,
                                                sources=sources, max_pages=max_pages)
@@ -1268,12 +1274,14 @@ def _tab_settings(settings: dict) -> dict:
         # ── Search defaults ───────────────────────────────────────────────────
         st.markdown('<div class="section-title">Search Sources</div>',
                     unsafe_allow_html=True)
-        sd1, sd2, sd3, sd4, sd5 = st.columns(5)
-        src_indeed   = sd1.checkbox("Indeed (RSS)",    value=settings.get("sources_indeed",   True))
-        src_jobbank  = sd2.checkbox("Job Bank Canada", value=settings.get("sources_jobbank",  True))
-        src_linkedin = sd3.checkbox("LinkedIn",        value=settings.get("sources_linkedin", False))
-        src_adzuna   = sd4.checkbox("Adzuna",          value=settings.get("sources_adzuna",   False))
-        src_jooble   = sd5.checkbox("Jooble",          value=settings.get("sources_jooble",   False))
+        sr1c1, sr1c2, sr1c3 = st.columns(3)
+        src_indeed      = sr1c1.checkbox("Indeed (RSS)",    value=settings.get("sources_indeed",    True))
+        src_jobbank     = sr1c2.checkbox("Job Bank Canada", value=settings.get("sources_jobbank",   True))
+        src_linkedin    = sr1c3.checkbox("LinkedIn",        value=settings.get("sources_linkedin",  False))
+        sr2c1, sr2c2, sr2c3 = st.columns(3)
+        src_adzuna      = sr2c1.checkbox("Adzuna",          value=settings.get("sources_adzuna",    False))
+        src_jooble      = sr2c2.checkbox("Jooble",          value=settings.get("sources_jooble",    False))
+        src_jobrapido   = sr2c3.checkbox("Jobrapido",       value=settings.get("sources_jobrapido", False))
         max_pages    = st.slider("Pages per source", 1, 5, int(settings.get("max_search_pages", 2)))
 
         st.markdown('<div class="section-title">Adzuna API (Free)</div>',
@@ -1302,6 +1310,22 @@ def _tab_settings(settings: dict) -> dict:
             key="s_jooble_key",
         )
 
+        st.markdown('<div class="section-title">Jobrapido API (Free)</div>',
+                    unsafe_allow_html=True)
+        st.caption(
+            "Canadian job aggregator — listings link directly to company career pages, "
+            "which Playwright can auto-fill without bot detection. "
+            "Get your free publisher key at "
+            "[publishers.jobrapido.com](https://publishers.jobrapido.com) "
+            "— takes 2 minutes."
+        )
+        jobrapido_api_key = st.text_input(
+            "Jobrapido Publisher Key",
+            value=settings.get("jobrapido_api_key", ""),
+            type="password",
+            key="s_jobrapido_key",
+        )
+
         if st.form_submit_button("Save Settings", type="primary", use_container_width=True):
             new_settings = {
                 "anthropic_api_key":  api_key,
@@ -1319,9 +1343,11 @@ def _tab_settings(settings: dict) -> dict:
                 "sources_linkedin":   src_linkedin,
                 "sources_adzuna":     src_adzuna,
                 "sources_jooble":     src_jooble,
+                "sources_jobrapido":  src_jobrapido,
                 "adzuna_app_id":      adzuna_app_id,
                 "adzuna_app_key":     adzuna_app_key,
                 "jooble_api_key":     jooble_api_key,
+                "jobrapido_api_key":  jobrapido_api_key,
                 "max_search_pages":   max_pages,
             }
             _save_settings(new_settings)

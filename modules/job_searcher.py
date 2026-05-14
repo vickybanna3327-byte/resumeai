@@ -38,9 +38,10 @@ from modules.database import get_connection, init_db
 
 INDEED_BASE   = "https://ca.indeed.com"
 JOBBANK_BASE  = "https://www.jobbank.gc.ca"
-ADZUNA_BASE   = "https://api.adzuna.com/v1/api/jobs/ca"
-JOOBLE_BASE   = "https://jooble.org/api"
-LINKEDIN_BASE = "https://www.linkedin.com"
+ADZUNA_BASE      = "https://api.adzuna.com/v1/api/jobs/ca"
+JOOBLE_BASE      = "https://jooble.org/api"
+JOBRAPIDO_BASE   = "https://api.jobrapido.com/v1/jobs/search"
+LINKEDIN_BASE    = "https://www.linkedin.com"
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -77,11 +78,13 @@ class JobSearcher:
         adzuna_app_id: str = "",
         adzuna_app_key: str = "",
         jooble_api_key: str = "",
+        jobrapido_api_key: str = "",
     ):
-        self.headless        = headless
-        self.adzuna_app_id   = adzuna_app_id
-        self.adzuna_app_key  = adzuna_app_key
-        self.jooble_api_key  = jooble_api_key
+        self.headless           = headless
+        self.adzuna_app_id      = adzuna_app_id
+        self.adzuna_app_key     = adzuna_app_key
+        self.jooble_api_key     = jooble_api_key
+        self.jobrapido_api_key  = jobrapido_api_key
         self._errors: list[str] = []
         init_db()
 
@@ -104,9 +107,10 @@ class JobSearcher:
         all_jobs: list[dict] = []
 
         dispatch = {
-            "jobbank": self._jobbank_search_html,
-            "adzuna":  self._adzuna_search,
-            "jooble":  self._jooble_search,
+            "jobbank":    self._jobbank_search_html,
+            "adzuna":     self._adzuna_search,
+            "jooble":     self._jooble_search,
+            "jobrapido":  self._jobrapido_search,
         }
 
         for source in sources:
@@ -405,6 +409,84 @@ class JobSearcher:
 
             except Exception as exc:
                 self._errors.append(f"[jooble] {type(exc).__name__}: {exc}")
+                break
+
+        return jobs
+
+    # ──────────────────────────── Jobrapido API ───────────────────────────────
+
+    def _jobrapido_search(self, query: str, location: str, max_pages: int) -> list[dict]:
+        """
+        Jobrapido API — Canadian job aggregator; listings link to company career pages.
+        Endpoint: https://api.jobrapido.com/v1/jobs/search
+        Register at publishers.jobrapido.com for a free publisher API key.
+        Results redirect to company career pages — Playwright can auto-fill them.
+        """
+        if not self.jobrapido_api_key:
+            self._errors.append(
+                "[jobrapido] API key not set. "
+                "Register free at publishers.jobrapido.com, then add the key in Settings."
+            )
+            return []
+
+        city = location.split(",")[0].strip()
+        jobs: list[dict] = []
+
+        for page_num in range(max_pages):
+            params = {
+                "q":         query,
+                "l":         city,
+                "country":   "ca",
+                "publisher": self.jobrapido_api_key,
+                "page":      page_num + 1,
+            }
+            print(f"[jobrapido] Page {page_num + 1}: GET {JOBRAPIDO_BASE}")
+
+            try:
+                resp = requests.get(
+                    JOBRAPIDO_BASE,
+                    params=params,
+                    headers={"User-Agent": random.choice(USER_AGENTS)},
+                    timeout=20,
+                )
+                if resp.status_code == 401:
+                    self._errors.append(
+                        "[jobrapido] HTTP 401 — Invalid API key. "
+                        "Check your publisher key in Settings."
+                    )
+                    break
+                if resp.status_code == 403:
+                    self._errors.append(
+                        "[jobrapido] HTTP 403 — Access denied. "
+                        "Verify your publisher key is approved at publishers.jobrapido.com."
+                    )
+                    break
+                resp.raise_for_status()
+                data = resp.json()
+                # API may return jobs under different keys depending on version
+                results = (
+                    data.get("jobs")
+                    or data.get("results")
+                    or data.get("data")
+                    or []
+                )
+                print(f"[jobrapido] {len(results)} results on page {page_num + 1}")
+
+                if not results:
+                    break
+
+                for item in results:
+                    job = _jobrapido_item_to_job(item)
+                    if job:
+                        jobs.append(job)
+
+                if len(results) < 10:
+                    break
+
+                time.sleep(random.uniform(0.5, 1.2))
+
+            except Exception as exc:
+                self._errors.append(f"[jobrapido] {type(exc).__name__}: {exc}")
                 break
 
         return jobs
@@ -990,6 +1072,36 @@ def _jooble_item_to_job(item: dict) -> dict | None:
     }
 
 
+def _jobrapido_item_to_job(item: dict) -> dict | None:
+    title = _clean(item.get("title") or item.get("jobtitle") or "")
+    # url is the destination company career-page URL (not a Jobrapido redirect)
+    url   = (
+        item.get("url") or item.get("apply_url")
+        or item.get("link") or item.get("href") or ""
+    )
+    if not title or not url:
+        return None
+
+    # Location: prefer structured city/region fields, fall back to flat string
+    city   = item.get("city", "") or ""
+    region = item.get("region") or item.get("state") or item.get("province") or ""
+    if city or region:
+        location = _clean(", ".join(p for p in (city, region) if p))
+    else:
+        location = _clean(item.get("location", ""))
+
+    return {
+        "title":       title,
+        "company":     _clean(item.get("company") or item.get("advertiser") or ""),
+        "location":    location,
+        "salary":      _clean(item.get("salary") or item.get("wage") or ""),
+        "date_posted": (item.get("date") or item.get("pubDate") or item.get("created") or "")[:10],
+        "url":         url,
+        "source":      "jobrapido",
+        "description": _clean(item.get("description") or item.get("snippet") or ""),
+    }
+
+
 def _clean(text: str | None) -> str:
     if not text:
         return ""
@@ -1062,5 +1174,25 @@ def _test_sources(query: str = "data analyst", location: str = "Edmonton, AB") -
             print(f"  [adzuna]       WARN — HTTP {resp.status_code}")
     except Exception as e:
         print(f"  [adzuna]       FAIL — {type(e).__name__}: {e}")
+
+    # ── Jobrapido API ─────────────────────────────────────────────────────────
+    try:
+        resp = requests.get(
+            JOBRAPIDO_BASE,
+            params={"q": query, "l": location.split(",")[0], "country": "ca",
+                    "publisher": "TEST"},
+            headers={"User-Agent": USER_AGENTS[0]},
+            timeout=10,
+        )
+        if resp.status_code in (401, 403):
+            print(f"  [jobrapido]    OK  — API reachable ({resp.status_code} expected w/ test key; add real key in Settings)")
+        elif resp.status_code == 200:
+            data = resp.json()
+            n = len(data.get("jobs") or data.get("results") or data.get("data") or [])
+            print(f"  [jobrapido]    OK  — {n} results")
+        else:
+            print(f"  [jobrapido]    WARN — HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"  [jobrapido]    FAIL — {type(e).__name__}: {e}")
 
     print(sep + "\n")
