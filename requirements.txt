@@ -6,4 +6,5 @@ python-docx
 playwright
 pandas
 reportlab
+nest_asyncio
 # sqlite3 is a Python built-in — no install needed

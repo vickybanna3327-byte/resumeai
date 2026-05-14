@@ -2,21 +2,30 @@
 
 Architecture
 ------------
-- Indeed   : requests + BeautifulSoup (PRIMARY — no asyncio, works inside Streamlit)
-- LinkedIn : Playwright running in a dedicated ThreadPoolExecutor thread with its
-             own event loop (avoids NotImplementedError from Streamlit's event loop)
+Indeed  : Indeed RSS feed (ca.indeed.com/rss) — pure HTTP, public, not blockable,
+          returns title / company / description / date / URL as XML.
+LinkedIn: Playwright (async) running via nest_asyncio, which patches the running
+          event loop so asyncio can be nested inside Streamlit on Windows.
 
 Results are deduplicated by URL and persisted to SQLite.
 """
 import asyncio
-import concurrent.futures
 import random
 import re
 import time
+import xml.etree.ElementTree as ET
 from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
+
+# Apply nest_asyncio immediately so Playwright can run inside Streamlit's loop
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass  # Will warn at runtime if Playwright is actually needed
+
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 from modules.database import get_connection, init_db
@@ -50,12 +59,13 @@ POPUP_SELECTORS = [
 
 class JobSearcher:
     """
-    Scrapes Indeed Canada (requests+BS4) and LinkedIn (Playwright in a thread).
+    Searches Indeed (via RSS feed) and LinkedIn (via Playwright).
 
     Usage:
-        searcher = JobSearcher(headless=True)
+        searcher = JobSearcher()
         jobs = searcher.search("Data Analyst", "Edmonton, AB", max_pages=3)
-        print(searcher.errors)   # any warnings / non-fatal messages
+        for msg in searcher.errors:
+            print(msg)
     """
 
     def __init__(self, headless: bool = True):
@@ -76,37 +86,39 @@ class JobSearcher:
         sources: list[str] | None = None,
         max_pages: int = 3,
     ) -> list[dict]:
-        """Search job boards synchronously. Safe to call from Streamlit."""
+        """Synchronous search. Safe to call from Streamlit."""
         self._errors = []
         sources = sources or ["indeed", "linkedin"]
         all_jobs: list[dict] = []
 
-        # ── PRIMARY: requests+BS4 for Indeed ─────────────────────────────────
+        # ── Indeed via RSS — no browser, not blockable ────────────────────────
         if "indeed" in sources:
             try:
-                jobs = self._indeed_search_bs4(query, location, max_pages)
+                jobs = self._indeed_search_rss(query, location, max_pages)
                 all_jobs.extend(jobs)
-                print(f"[indeed-bs4] {len(jobs)} jobs found")
+                print(f"[indeed-rss] {len(jobs)} jobs")
                 if not jobs:
                     self._errors.append(
-                        "[indeed] 0 jobs returned — Indeed may be blocking the request "
-                        "or the selectors changed. Check the terminal for details."
+                        "[indeed] RSS returned 0 jobs. The feed may be empty for this "
+                        "query/location combination, or Indeed's RSS is temporarily unavailable."
                     )
             except Exception as exc:
                 self._errors.append(
-                    f"[indeed] requests+BS4 failed — {type(exc).__name__}: {exc}"
+                    f"[indeed] RSS search failed — {type(exc).__name__}: {exc}"
                 )
 
-        # ── OPTIONAL: Playwright in isolated thread for LinkedIn ──────────────
+        # ── LinkedIn via Playwright + nest_asyncio ────────────────────────────
         if "linkedin" in sources:
             try:
-                jobs = self._playwright_threaded(query, location, ["linkedin"], max_pages)
+                jobs = self._run_async(
+                    self._playwright_search_async(query, location, ["linkedin"], max_pages)
+                )
                 all_jobs.extend(jobs)
-                print(f"[linkedin-playwright] {len(jobs)} jobs found")
+                print(f"[linkedin-pw] {len(jobs)} jobs")
             except Exception as exc:
                 self._errors.append(
                     f"[linkedin] Playwright failed — {type(exc).__name__}: {exc}\n"
-                    "Fix: run  playwright install chromium  in your terminal."
+                    "Fix: pip install nest_asyncio && playwright install chromium"
                 )
 
         saved = _save_to_db(all_jobs)
@@ -114,159 +126,77 @@ class JobSearcher:
         return saved
 
     def get_job_details(self, url: str) -> dict:
-        """Fetch the full job description text. Uses BS4 for Indeed, Playwright for LinkedIn."""
+        """Fetch the full job description for a single listing."""
         if "indeed.com" in url:
             return self._fetch_indeed_details_bs4(url)
+        # LinkedIn requires Playwright
         try:
-            return self._playwright_threaded_details(url)
+            return self._run_async(self._fetch_details_async(url))
         except Exception as exc:
-            self._errors.append(f"[details] Playwright failed: {exc}")
+            self._errors.append(f"[details] {type(exc).__name__}: {exc}")
             return {"url": url, "description": ""}
 
-    # ──────────────────── Indeed: requests + BeautifulSoup ───────────────────
+    # ──────────────────── Indeed: RSS feed (primary) ─────────────────────────
 
-    def _indeed_search_bs4(self, query: str, location: str, max_pages: int) -> list[dict]:
-        """Primary Indeed scraper — fully synchronous, no event loop dependency."""
-        session = self._make_session()
+    def _indeed_search_rss(self, query: str, location: str, max_pages: int) -> list[dict]:
+        """
+        Parse Indeed's public RSS feed.  Returns XML — no JavaScript, no CAPTCHA,
+        no 403.  Each <item> contains title, link, description (HTML snippet),
+        and pubDate.
+        """
+        session = _make_session()
         jobs: list[dict] = []
-
-        # Warm up the session with a homepage visit so cookies are set
-        try:
-            session.get(INDEED_BASE, timeout=15)
-            time.sleep(random.uniform(1.0, 2.0))
-        except Exception:
-            pass
 
         for page_num in range(max_pages):
             url = (
-                f"{INDEED_BASE}/jobs?"
+                f"{INDEED_BASE}/rss?"
                 f"q={quote_plus(query)}"
                 f"&l={quote_plus(location)}"
                 f"&sort=date"
                 f"&start={page_num * 10}"
             )
-            print(f"[indeed-bs4] Page {page_num + 1}: {url}")
+            print(f"[indeed-rss] Page {page_num + 1}: {url}")
 
             try:
-                resp = session.get(url, timeout=25)
-                print(f"[indeed-bs4] HTTP {resp.status_code}, {len(resp.text)} chars")
+                resp = session.get(url, timeout=20)
+                print(f"[indeed-rss] HTTP {resp.status_code}, {len(resp.content)} bytes")
 
-                if resp.status_code == 403:
+                if resp.status_code != 200:
                     self._errors.append(
-                        "[indeed] HTTP 403 — request was blocked. "
-                        "Indeed may require a real browser. Try disabling headless mode."
+                        f"[indeed-rss] HTTP {resp.status_code} on page {page_num + 1}"
                     )
                     break
 
-                soup = BeautifulSoup(resp.text, "html.parser")
+                items = _parse_rss(resp.content)
+                print(f"[indeed-rss] {len(items)} items on page {page_num + 1}")
 
-                # Detect CAPTCHA / bot wall
-                if soup.select_one("div#captcha-container, div.icl-Card--captcha, #recaptcha"):
-                    self._errors.append(
-                        "[indeed] CAPTCHA detected — Indeed is blocking automated requests. "
-                        "Open ca.indeed.com in your browser to solve it, then retry."
-                    )
+                if not items:
                     break
 
-                cards = soup.select(
-                    "div.job_seen_beacon, "
-                    "div[data-testid='slider_item'], "
-                    "li.css-1ac2h1w, "
-                    "div.jobCard_mainContent"
-                )
-                print(f"[indeed-bs4] Found {len(cards)} cards")
-
-                if not cards:
-                    # Dump a snippet to help diagnose selector drift
-                    snippet = soup.get_text()[:500].replace("\n", " ")
-                    print(f"[indeed-bs4] Page snippet: {snippet}")
-                    self._errors.append(
-                        f"[indeed] No job cards found on page {page_num + 1}. "
-                        "Indeed's HTML structure may have changed."
-                    )
-                    break
-
-                for card in cards:
-                    job = self._parse_indeed_card_bs4(card)
+                for raw in items:
+                    job = _rss_item_to_job(raw, location)
                     if job:
                         jobs.append(job)
 
-                print(f"[indeed-bs4] Extracted {len(jobs)} jobs so far")
-
-                # Check for next page
-                next_btn = soup.select_one(
-                    "a[data-testid='pagination-page-next'], "
-                    "a[aria-label='Next Page'], "
-                    "a[aria-label='Next']"
-                )
-                if not next_btn:
+                # Indeed RSS returns fewer than 10 items on the last page
+                if len(items) < 10:
                     break
 
-                time.sleep(random.uniform(2.0, 4.0))
+                time.sleep(random.uniform(1.0, 2.5))
 
-            except requests.RequestException as exc:
-                self._errors.append(f"[indeed] Request error on page {page_num + 1}: {exc}")
+            except Exception as exc:
+                self._errors.append(
+                    f"[indeed-rss] Page {page_num + 1} error — {type(exc).__name__}: {exc}"
+                )
                 break
 
         return jobs
 
-    def _parse_indeed_card_bs4(self, card) -> dict | None:
-        try:
-            title_el = card.select_one(
-                "h2[data-testid='jobTitle'] a, "
-                "a.jcs-JobTitle, "
-                "h2.jobTitle a, "
-                "a[id^='jobTitle'], "
-                "h2 a[data-jk]"
-            )
-            if not title_el:
-                return None
-            title = _clean(title_el.get_text())
-
-            jk = card.get("data-jk", "") or title_el.get("data-jk", "")
-            href = title_el.get("href", "")
-            if jk:
-                job_url = f"{INDEED_BASE}/viewjob?jk={jk}"
-            elif href:
-                job_url = f"{INDEED_BASE}{href}" if href.startswith("/") else href
-            else:
-                return None
-
-            company_el = card.select_one(
-                "[data-testid='company-name'], span.companyName, "
-                ".css-63koeb, [data-testid='inlineHeader-companyName']"
-            )
-            loc_el = card.select_one(
-                "[data-testid='text-location'], div.companyLocation, "
-                ".css-1p0sjhy, [data-testid='job-location']"
-            )
-            salary_el = card.select_one(
-                "[data-testid='attribute_snippet_testid'], "
-                "div.salary-snippet-container, "
-                ".metadataContainer .attribute_snippet"
-            )
-            date_el = card.select_one(
-                "[data-testid='myJobsStateDate'], span.date, "
-                ".css-qvloho, span[class*='date']"
-            )
-
-            return {
-                "title":       title,
-                "company":     _clean(company_el.get_text()) if company_el else "",
-                "location":    _clean(loc_el.get_text()) if loc_el else "",
-                "salary":      _clean(salary_el.get_text()) if salary_el else "",
-                "date_posted": _clean(date_el.get_text()) if date_el else "",
-                "url":         job_url,
-                "source":      "indeed",
-                "description": "",
-            }
-        except Exception as exc:
-            print(f"[indeed-bs4] Card parse error: {exc}")
-            return None
+    # ──────────────────── Indeed: description fetch via BS4 ──────────────────
 
     def _fetch_indeed_details_bs4(self, url: str) -> dict:
-        """Fetch a single Indeed job description via requests."""
-        session = self._make_session()
+        """Fetch a full job description from an Indeed listing page."""
+        session = _make_session()
         description = ""
         try:
             resp = session.get(url, timeout=20)
@@ -279,98 +209,32 @@ class JobSearcher:
             if desc_el:
                 description = _clean(desc_el.get_text(separator=" "))
         except Exception as exc:
-            print(f"[indeed-details-bs4] Error: {exc}")
+            print(f"[indeed-details] {exc}")
 
         if description:
             _update_description(url, description)
         return {"url": url, "description": description}
 
-    @staticmethod
-    def _make_session() -> requests.Session:
-        """Build a requests Session that looks like a real browser."""
-        s = requests.Session()
-        s.headers.update({
-            "User-Agent":                random.choice(USER_AGENTS),
-            "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language":           "en-CA,en-US;q=0.7,en;q=0.3",
-            "Accept-Encoding":           "gzip, deflate, br",
-            "DNT":                       "1",
-            "Connection":                "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest":            "document",
-            "Sec-Fetch-Mode":            "navigate",
-            "Sec-Fetch-Site":            "none",
-            "Sec-Fetch-User":            "?1",
-            "Cache-Control":             "max-age=0",
-        })
-        return s
+    # ─────────────────── Playwright: nest_asyncio runner ─────────────────────
 
-    # ──────────────────── Playwright in isolated thread ──────────────────────
-
-    def _playwright_threaded(
-        self,
-        query: str,
-        location: str,
-        sources: list[str],
-        max_pages: int,
-    ) -> list[dict]:
-        """Run async Playwright in a dedicated thread with its own event loop.
-
-        This is the correct pattern when the calling thread (Streamlit) already
-        owns an event loop — calling asyncio.run() from there raises
-        NotImplementedError on Windows.
+    def _run_async(self, coro):
         """
-        result: list[dict] = []
-        thread_errors: list[str] = []
+        Run a coroutine safely whether or not an event loop is already running.
 
-        def _thread_target():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(
-                    self._playwright_search_async(query, location, sources, max_pages)
-                )
-            except Exception as exc:
-                thread_errors.append(f"{type(exc).__name__}: {exc}")
-                return []
-            finally:
-                loop.close()
+        nest_asyncio patches loop.run_until_complete() so it can be called
+        from within a running loop (Streamlit on Windows).  Without it,
+        get_event_loop().run_until_complete() raises RuntimeError/
+        NotImplementedError when called from Streamlit's thread.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            # We're inside Streamlit's loop — nest_asyncio makes this safe
+            return loop.run_until_complete(coro)
+        except RuntimeError:
+            # No running loop — standard path (e.g. CLI / test)
+            return asyncio.run(coro)
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_thread_target)
-            try:
-                result = future.result(timeout=300)
-            except concurrent.futures.TimeoutError:
-                thread_errors.append("Playwright timed out after 5 minutes.")
-            except Exception as exc:
-                thread_errors.append(f"{type(exc).__name__}: {exc}")
-
-        for err in thread_errors:
-            self._errors.append(f"[playwright-thread] {err}")
-
-        return result
-
-    def _playwright_threaded_details(self, url: str) -> dict:
-        """Fetch job description via Playwright in an isolated thread."""
-        result: dict = {"url": url, "description": ""}
-
-        def _thread_target():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(self._fetch_details_async(url))
-            finally:
-                loop.close()
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            try:
-                result = pool.submit(_thread_target).result(timeout=60)
-            except Exception as exc:
-                self._errors.append(f"[details-playwright] {type(exc).__name__}: {exc}")
-
-        return result
-
-    # ──────────────────────── Playwright async core ──────────────────────────
+    # ──────────────────── Playwright: async search core ──────────────────────
 
     async def _playwright_search_async(
         self,
@@ -402,10 +266,10 @@ class JobSearcher:
 
             for source in sources:
                 try:
-                    if source == "indeed":
-                        jobs = await self._scrape_indeed_pw(context, query, location, max_pages)
-                    elif source == "linkedin":
+                    if source == "linkedin":
                         jobs = await self._scrape_linkedin_pw(context, query, location, max_pages)
+                    elif source == "indeed":
+                        jobs = await self._scrape_indeed_pw(context, query, location, max_pages)
                     else:
                         continue
                     all_jobs.extend(jobs)
@@ -418,11 +282,110 @@ class JobSearcher:
 
         return all_jobs
 
-    # ─────────────────────── Playwright: Indeed ──────────────────────────────
+    # ─────────────────────── Playwright: LinkedIn ────────────────────────────
+
+    async def _scrape_linkedin_pw(
+        self, context: BrowserContext, query: str, location: str, max_pages: int
+    ) -> list[dict]:
+        page = await context.new_page()
+        await _stealth(page)
+        jobs: list[dict] = []
+
+        for page_num in range(max_pages):
+            url = (
+                f"{LINKEDIN_BASE}/jobs/search/?"
+                f"keywords={quote_plus(query)}"
+                f"&location={quote_plus(location)}"
+                f"&sortBy=DD"
+                f"&start={page_num * 25}"
+            )
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                await _delay(2.5, 4.5)
+                await _dismiss_popups(page)
+
+                if any(kw in page.url for kw in ("authwall", "/login", "/checkpoint")):
+                    self._errors.append(
+                        "[linkedin] Auth wall — LinkedIn requires login. "
+                        "Add your credentials in Settings."
+                    )
+                    break
+
+                await _scroll(page, distance=2500)
+                await _delay(1.5, 2.5)
+
+                cards = await _find_first(page, [
+                    "ul.jobs-search__results-list > li",
+                    "div.base-card",
+                    "li[data-occludable-job-id]",
+                ])
+                if not cards:
+                    break
+
+                page_jobs = []
+                for card in cards:
+                    job = await self._parse_linkedin_card(card)
+                    if job:
+                        page_jobs.append(job)
+
+                jobs.extend(page_jobs)
+                if len(page_jobs) < 20:
+                    break
+                await _delay(2.5, 4.0)
+
+            except Exception as exc:
+                print(f"[linkedin-pw] Page {page_num + 1}: {exc}")
+                break
+
+        await page.close()
+        return jobs
+
+    async def _parse_linkedin_card(self, card) -> dict | None:
+        try:
+            url_el = await _first_el(card, [
+                "a.base-card__full-link",
+                "a[data-tracking-id='srp-super-premium-job-title']",
+                "a[href*='/jobs/view/']",
+            ])
+            if not url_el:
+                return None
+            raw_url = await url_el.get_attribute("href") or ""
+            url = raw_url.split("?")[0]
+            if not url:
+                return None
+
+            title = await _text(card, [
+                "h3.base-search-card__title",
+                "span[aria-hidden='true']",
+            ]) or _clean(await url_el.inner_text())
+
+            date_el = await _first_el(card, ["time[datetime]", ".job-search-card__listdate"])
+            date_posted = ""
+            if date_el:
+                date_posted = (
+                    await date_el.get_attribute("datetime")
+                    or _clean(await date_el.inner_text())
+                )
+
+            return {
+                "title":       _clean(title),
+                "company":     await _text(card, ["h4.base-search-card__subtitle", ".base-search-card__subtitle a"]),
+                "location":    await _text(card, ["span.job-search-card__location", ".base-search-card__metadata span"]),
+                "salary":      "",
+                "date_posted": date_posted,
+                "url":         url,
+                "source":      "linkedin",
+                "description": "",
+            }
+        except Exception:
+            return None
+
+    # ─────────────────────── Playwright: Indeed (optional) ───────────────────
 
     async def _scrape_indeed_pw(
         self, context: BrowserContext, query: str, location: str, max_pages: int
     ) -> list[dict]:
+        """Playwright-based Indeed scraper — only used when explicitly requested."""
         page = await context.new_page()
         await _stealth(page)
         jobs: list[dict] = []
@@ -449,168 +412,61 @@ class JobSearcher:
                     break
 
                 for card in cards:
-                    job = await self._parse_indeed_card_pw(card)
-                    if job:
-                        jobs.append(job)
+                    title_el = await _first_el(card, [
+                        "h2[data-testid='jobTitle'] a", "a.jcs-JobTitle", "h2.jobTitle a",
+                    ])
+                    if not title_el:
+                        continue
+                    jk   = await card.get_attribute("data-jk") or ""
+                    href = await title_el.get_attribute("href") or ""
+                    job_url = (
+                        f"{INDEED_BASE}/viewjob?jk={jk}" if jk
+                        else (f"{INDEED_BASE}{href}" if href.startswith("/") else href)
+                    )
+                    if not job_url:
+                        continue
+                    jobs.append({
+                        "title":       _clean(await title_el.inner_text()),
+                        "company":     await _text(card, ["[data-testid='company-name']", "span.companyName"]),
+                        "location":    await _text(card, ["[data-testid='text-location']", "div.companyLocation"]),
+                        "salary":      await _text(card, ["[data-testid='attribute_snippet_testid']"]),
+                        "date_posted": await _text(card, ["[data-testid='myJobsStateDate']", "span.date"]),
+                        "url":         job_url,
+                        "source":      "indeed",
+                        "description": "",
+                    })
 
                 if not await _indeed_has_next(page):
                     break
                 await _delay(2.0, 4.0)
 
             except Exception as exc:
-                print(f"[indeed-pw] Page {page_num + 1} error: {exc}")
+                print(f"[indeed-pw] Page {page_num + 1}: {exc}")
                 break
 
         await page.close()
         return jobs
-
-    async def _parse_indeed_card_pw(self, card) -> dict | None:
-        try:
-            title_el = await _first_el(card, [
-                "h2[data-testid='jobTitle'] a", "a.jcs-JobTitle",
-                "h2.jobTitle a", "a[id^='jobTitle']",
-            ])
-            if not title_el:
-                return None
-            title = _clean(await title_el.inner_text())
-            href  = await title_el.get_attribute("href") or ""
-            jk    = await card.get_attribute("data-jk") or ""
-            url   = (
-                f"{INDEED_BASE}/viewjob?jk={jk}" if jk
-                else (f"{INDEED_BASE}{href}" if href.startswith("/") else href)
-            )
-            if not url:
-                return None
-
-            return {
-                "title":       title,
-                "company":     await _text(card, ["[data-testid='company-name']", "span.companyName"]),
-                "location":    await _text(card, ["[data-testid='text-location']", "div.companyLocation"]),
-                "salary":      await _text(card, ["[data-testid='attribute_snippet_testid']", "div.salary-snippet-container"]),
-                "date_posted": await _text(card, ["[data-testid='myJobsStateDate']", "span.date"]),
-                "url":         url,
-                "source":      "indeed",
-                "description": "",
-            }
-        except Exception:
-            return None
-
-    # ─────────────────────── Playwright: LinkedIn ────────────────────────────
-
-    async def _scrape_linkedin_pw(
-        self, context: BrowserContext, query: str, location: str, max_pages: int
-    ) -> list[dict]:
-        page = await context.new_page()
-        await _stealth(page)
-        jobs: list[dict] = []
-
-        for page_num in range(max_pages):
-            url = (
-                f"{LINKEDIN_BASE}/jobs/search/?"
-                f"keywords={quote_plus(query)}&location={quote_plus(location)}"
-                f"&sortBy=DD&start={page_num * 25}"
-            )
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                await _delay(2.5, 4.5)
-                await _dismiss_popups(page)
-
-                if any(kw in page.url for kw in ("authwall", "/login", "/checkpoint")):
-                    self._errors.append(
-                        "[linkedin] Auth wall detected — LinkedIn requires login for full results. "
-                        "Add your credentials in Settings."
-                    )
-                    break
-
-                await _scroll(page, distance=2500)
-                await _delay(1.5, 2.5)
-
-                cards = await _find_first(page, [
-                    "ul.jobs-search__results-list > li",
-                    "div.base-card",
-                    "li[data-occludable-job-id]",
-                ])
-                if not cards:
-                    break
-
-                page_jobs = []
-                for card in cards:
-                    job = await self._parse_linkedin_card_pw(card)
-                    if job:
-                        page_jobs.append(job)
-
-                jobs.extend(page_jobs)
-                if len(page_jobs) < 20:
-                    break
-                await _delay(2.5, 4.0)
-
-            except Exception as exc:
-                print(f"[linkedin-pw] Page {page_num + 1} error: {exc}")
-                break
-
-        await page.close()
-        return jobs
-
-    async def _parse_linkedin_card_pw(self, card) -> dict | None:
-        try:
-            url_el = await _first_el(card, [
-                "a.base-card__full-link",
-                "a[data-tracking-id='srp-super-premium-job-title']",
-                "a[href*='/jobs/view/']",
-            ])
-            if not url_el:
-                return None
-            raw_url = await url_el.get_attribute("href") or ""
-            url = raw_url.split("?")[0]
-            if not url:
-                return None
-
-            title = await _text(card, [
-                "h3.base-search-card__title", "span[aria-hidden='true']",
-            ]) or _clean(await url_el.inner_text())
-
-            date_el = await _first_el(card, ["time[datetime]", ".job-search-card__listdate"])
-            date_posted = ""
-            if date_el:
-                date_posted = (
-                    await date_el.get_attribute("datetime")
-                    or _clean(await date_el.inner_text())
-                )
-
-            return {
-                "title":       _clean(title),
-                "company":     await _text(card, ["h4.base-search-card__subtitle", ".base-search-card__subtitle a"]),
-                "location":    await _text(card, ["span.job-search-card__location", ".base-search-card__metadata span"]),
-                "salary":      "",
-                "date_posted": date_posted,
-                "url":         url,
-                "source":      "linkedin",
-                "description": "",
-            }
-        except Exception:
-            return None
 
     # ─────────────────────────── Job detail fetch ────────────────────────────
 
     async def _fetch_details_async(self, url: str) -> dict:
-        """Fetch full description from a single job page via Playwright."""
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(
                 headless=self.headless,
                 args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
             )
             context = await _new_context(browser)
-            page = await context.new_page()
+            page    = await context.new_page()
             await _stealth(page)
             description = ""
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 await _delay(1.5, 3.0)
                 await _dismiss_popups(page)
-                if "indeed.com" in url:
-                    description = await _indeed_description_pw(page)
-                elif "linkedin.com" in url:
+                if "linkedin.com" in url:
                     description = await _linkedin_description_pw(page)
+                elif "indeed.com" in url:
+                    description = await _indeed_description_pw(page)
             except Exception as exc:
                 print(f"[details-pw] {url}: {exc}")
             finally:
@@ -619,6 +475,83 @@ class JobSearcher:
         if description:
             _update_description(url, description)
         return {"url": url, "description": description}
+
+
+# ──────────────────────────── RSS parsing helpers ─────────────────────────────
+
+def _parse_rss(content: bytes) -> list[dict]:
+    """
+    Parse Indeed's RSS XML and return a list of raw item dicts.
+    Uses ElementTree (built-in).  Strips XML namespaces before parsing
+    so we don't have to register or handle namespace prefixes.
+    """
+    # Strip namespace declarations to simplify element lookup
+    clean = re.sub(r'\s+xmlns(?::\w+)?="[^"]*"', "", content.decode("utf-8", errors="replace"))
+    try:
+        root = ET.fromstring(clean)
+    except ET.ParseError as exc:
+        print(f"[rss] XML parse error: {exc}")
+        return []
+
+    channel = root.find("channel")
+    if channel is None:
+        return []
+
+    items = []
+    for item in channel.findall("item"):
+        items.append({
+            "title":    item.findtext("title", "").strip(),
+            "link":     item.findtext("link", "").strip() or item.findtext("guid", "").strip(),
+            "desc":     item.findtext("description", "").strip(),
+            "pub_date": item.findtext("pubDate", "").strip(),
+        })
+    return items
+
+
+def _rss_item_to_job(raw: dict, search_location: str) -> dict | None:
+    """Convert a raw RSS item dict into a job dict."""
+    title_raw = raw.get("title", "")
+    url       = raw.get("link", "")
+    if not title_raw or not url:
+        return None
+
+    title, company, location = _parse_rss_title(title_raw)
+
+    # Strip HTML from description (Indeed wraps it in HTML tags)
+    desc_html = raw.get("desc", "")
+    description = ""
+    if desc_html:
+        description = _clean(
+            BeautifulSoup(desc_html, "html.parser").get_text(separator=" ")
+        )
+
+    return {
+        "title":       title,
+        "company":     company,
+        "location":    location or search_location,
+        "salary":      "",
+        "date_posted": raw.get("pub_date", ""),
+        "url":         url,
+        "source":      "indeed",
+        "description": description,
+    }
+
+
+def _parse_rss_title(raw: str) -> tuple[str, str, str]:
+    """
+    Indeed RSS titles look like: 'Job Title - Company Name (City, Province)'
+    Returns (title, company, location).
+    """
+    location = ""
+    m = re.search(r"\(([^)]+)\)\s*$", raw)
+    if m:
+        location = m.group(1).strip()
+        raw = raw[: m.start()].strip()
+
+    parts = raw.split(" - ", 1)
+    title   = _clean(parts[0])
+    company = _clean(parts[1]) if len(parts) > 1 else ""
+    return title, company, location
 
 
 # ──────────────────────────────────── DB helpers ─────────────────────────────
@@ -633,20 +566,15 @@ def _save_to_db(jobs: list[dict]) -> list[dict]:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO jobs
-                        (title, company, url, location, salary, date_posted, source, description, status)
+                        (title, company, url, location, salary, date_posted,
+                         source, description, status)
                     VALUES
-                        (:title, :company, :url, :location, :salary, :date_posted, :source, :description, 'new')
+                        (:title, :company, :url, :location, :salary,
+                         :date_posted, :source, :description, 'new')
                     """,
-                    {
-                        "title":       job.get("title", ""),
-                        "company":     job.get("company", ""),
-                        "url":         job["url"],
-                        "location":    job.get("location", ""),
-                        "salary":      job.get("salary", ""),
-                        "date_posted": job.get("date_posted", ""),
-                        "source":      job.get("source", ""),
-                        "description": job.get("description", ""),
-                    },
+                    {k: job.get(k, "") for k in
+                     ("title", "company", "url", "location", "salary",
+                      "date_posted", "source", "description")},
                 )
                 saved.append(job)
             except Exception as exc:
@@ -703,6 +631,21 @@ async def _indeed_has_next(page: Page) -> bool:
 
 
 # ──────────────────────────────── Browser helpers ────────────────────────────
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent":                random.choice(USER_AGENTS),
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language":           "en-CA,en-US;q=0.7,en;q=0.3",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "DNT":                       "1",
+        "Connection":                "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control":             "max-age=0",
+    })
+    return s
+
 
 async def _new_context(browser):
     return await browser.new_context(
